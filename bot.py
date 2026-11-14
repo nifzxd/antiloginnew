@@ -1609,6 +1609,9 @@ async def license_detail_view(context, chat_id, message_id, short: str, banner: 
             InlineKeyboardButton("➕ 365d", callback_data=f"lic_ext_{short}_365"),
             InlineKeyboardButton("✏️ Custom", callback_data=f"lic_extc_{short}"),
         ])
+        keyboard.append([
+            InlineKeyboardButton("👥 Edit Quota", callback_data=f"lic_quota_{short}"),
+        ])
 
     if status == LICENSE_STATUS_REVOKED:
         keyboard.append([InlineKeyboardButton("🟢 Unrevoke", callback_data=f"lic_unrev_{short}")])
@@ -1770,6 +1773,35 @@ async def license_extend_execute(context, chat_id, message_id, short, days):
     await license_detail_view(context, chat_id, message_id, short,
                               banner=f"✅ Extend +{days}d successful.\n\n")
 
+
+async def license_edit_quota_execute(context, chat_id, message_id, short, new_quota):
+    rec = _license_db.find_by_short_hash(short)
+    if not rec:
+        await license_manager_view(context, chat_id, message_id)
+        return
+
+    old_quota = rec.max_accounts
+    rec.max_accounts = new_quota
+    rec.touch()
+    _license_db.update(rec)
+    
+    audit_logger.info(
+        "license_quota_edited key=%s old=%d new=%d",
+        rec.key_preview, old_quota, new_quota,
+    )
+    
+    if rec.owner_id:
+        await _notify_license_event(
+            _session_manager.bot_app, _config, rec.owner_id,
+            f"👥 <b>License Quota Updated</b>\n\n"
+            f"Key: <code>{html.escape(rec.key_preview)}</code>\n"
+            f"Quota: {old_quota} → <b>{new_quota}</b> accounts",
+        )
+        
+    await license_detail_view(
+        context, chat_id, message_id, short,
+        banner=f"✅ Quota updated: {old_quota} → {new_quota}.\n\n",
+    )
 
 async def license_revoke_confirm(context, chat_id, message_id, short):
     rec = _license_db.find_by_short_hash(short)
@@ -2413,6 +2445,26 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if short:
             await license_extend_execute(context, chat_id, message_id, short, days)
 
+    elif step == "wait_quota_value":
+        if not is_super_admin(user_id):
+            return
+        try:
+            quota = int(text)
+        except ValueError:
+            await render(context, chat_id, message_id,
+                         "❌ Send a whole number (1-100).",
+                         [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]])
+            return
+        if not (1 <= quota <= 100):
+            await render(context, chat_id, message_id,
+                         "❌ Range: 1-100 accounts.",
+                         [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]])
+            return
+        short = session.get("lic_short")
+        user_sessions.pop(user_id, None)
+        if short:
+            await license_edit_quota_execute(context, chat_id, message_id, short, quota)
+
     elif step == "wait_password":
         client = session["client"]
         phone = session.get("phone")
@@ -2719,7 +2771,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             quota_line = ""
             if lic:
                 used = count_owned_accounts(user_id)
-                quota_line = f"\nKuota akun       : {used}/{lic.max_accounts}"
+                quota_line = f"\nAccount quota       : {used}/{lic.max_accounts}"
             text = (
                 "📊 <b>Stats</b>\n"
                 f"Accounts         : <b>{total}</b>\n"
@@ -2881,6 +2933,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render(
                 context, chat_id, message_id,
                 f"✏️ Send the number of days (1-3650) for <code>{html.escape(rec.key_preview)}</code>:",
+                [[InlineKeyboardButton("❌ Cancel", callback_data=f"lic_detail_{short}")]],
+            )
+
+        elif data.startswith("lic_quota_"):
+            if not is_super_admin(user_id):
+                return
+            short = data[len("lic_quota_"):]
+            rec = _license_db.find_by_short_hash(short)
+            if not rec:
+                await license_manager_view(context, chat_id, message_id)
+                return
+            user_sessions[user_id]["step"] = "wait_quota_value"
+            user_sessions[user_id]["lic_short"] = short
+            await render(
+                context, chat_id, message_id,
+                f"👥 Send the new max account quota (1-100) for <code>{html.escape(rec.key_preview)}</code>:\n"
+                f"Current quota: <b>{rec.max_accounts}</b>",
                 [[InlineKeyboardButton("❌ Cancel", callback_data=f"lic_detail_{short}")]],
             )
 
