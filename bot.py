@@ -9,6 +9,7 @@ dns.resolver.default_resolver.nameservers = ['8.8.8.8', '1.1.1.1']
 dns.asyncresolver.default_resolver = dns.asyncresolver.Resolver(configure=False)
 dns.asyncresolver.default_resolver.nameservers = ['8.8.8.8', '1.1.1.1']
 
+import math
 import asyncio
 import dataclasses
 import html
@@ -1326,6 +1327,10 @@ def _license_remaining_text(rec: LicenseRecord) -> str:
     try:
         secs = (datetime.fromisoformat(rec.expires_at) - _utcnow()).total_seconds()
         d, h = int(secs // 86400), int((secs % 86400) // 3600)
+        if d == 0 and h == 0:
+            return "< 1 hour"
+        if d == 0:
+            return f"{h} hours"
         return f"{d} days {h} hours"
     except (TypeError, ValueError):
         return "?"
@@ -1338,7 +1343,7 @@ def _license_days_left_text(rec: LicenseRecord) -> str:
         return "expired"
     try:
         secs = (datetime.fromisoformat(rec.expires_at) - _utcnow()).total_seconds()
-        return f"{int(secs // 86400)}d"
+        return f"{math.ceil(secs / 86400)}d"
     except (TypeError, ValueError):
         return "?"
 
@@ -1369,7 +1374,7 @@ async def _unauthorized_screen_content(user_id: int):
             "You don't have a license yet.\n"
             "Send your license key to this chat, or press the button below."
         )
-        kb = [[InlineKeyboardButton("🎫 Redeem License", callback_data="lic_redeem")]]
+        kb = [[InlineKeyboardButton("🎫 Redeem License", callback_data="lic_redeem")], [InlineKeyboardButton("👨‍💻 Buy License", url="https://t.me/nifzz")]]
     return text, kb
 
 
@@ -1518,7 +1523,7 @@ async def my_license_view(context, chat_id, message_id, user_id: int):
         if authorized:
             kb = [[InlineKeyboardButton("🔙 Back", callback_data="menu")]]
         else:
-            kb = [[InlineKeyboardButton("🎫 Redeem License", callback_data="lic_redeem")]]
+            kb = [[InlineKeyboardButton("🎫 Redeem License", callback_data="lic_redeem")], [InlineKeyboardButton("👨‍💻 Buy License", url="https://t.me/nifzz")]]
         await render(
             context, chat_id, message_id,
             "🔑 <b>My License</b>\n\nYou don't have a license yet.",
@@ -1566,6 +1571,7 @@ async def license_generate_start(context, chat_id, message_id):
              InlineKeyboardButton("180 days", callback_data="lic_gen_d180")],
             [InlineKeyboardButton("365 days", callback_data="lic_gen_d365"),
              InlineKeyboardButton("Lifetime ♾️", callback_data="lic_gen_dlife")],
+            [InlineKeyboardButton("✏️ Custom Days", callback_data="lic_gen_dcustom")],
             [InlineKeyboardButton("🔙 Cancel", callback_data="lic_mgr")],
         ],
     )
@@ -1577,13 +1583,14 @@ async def license_generate_quota(context, chat_id, message_id, user_id, duration
         "7": "7 days", "14": "14 days", "30": "30 days", "60": "60 days",
         "90": "90 days", "180": "180 days", "365": "365 days",
         "life": "Lifetime ♾️",
-    }.get(duration, duration)
+    }.get(duration, f"{duration} days")
     await render(
         context, chat_id, message_id,
         f"➕ <b>Generate License</b>\n\nDuration: {label}\nChoose account quota:", [
             [InlineKeyboardButton("1 account", callback_data="lic_gen_q1")],
             [InlineKeyboardButton("3 accounts", callback_data="lic_gen_q3")],
             [InlineKeyboardButton("5 accounts", callback_data="lic_gen_q5")],
+            [InlineKeyboardButton("✏️ Custom Quota", callback_data="lic_gen_qcustom")],
             [InlineKeyboardButton("🔙 Cancel", callback_data="lic_mgr")],
         ],
     )
@@ -2311,6 +2318,46 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render(context, chat_id, message_id,
                          f"❌ Error: {html.escape(str(e))}", cancel_keyboard())
 
+    elif step == "wait_custom_days":
+        if not is_super_admin(user_id):
+            return
+        try:
+            days = int(text)
+        except ValueError:
+            await render(context, chat_id, message_id,
+                         "❌ Send a whole number (1-3650).",
+                         [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]])
+            return
+        if not (1 <= days <= 3650):
+            await render(context, chat_id, message_id,
+                         "❌ Range: 1-3650 days.",
+                         [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]])
+            return
+        user_sessions.pop(user_id, None)
+        await license_generate_quota(context, chat_id, message_id, user_id, str(days))
+
+    elif step == "wait_custom_quota":
+        if not is_super_admin(user_id):
+            return
+        try:
+            quota = int(text)
+        except ValueError:
+            await render(context, chat_id, message_id,
+                         "❌ Send a whole number (1-100).",
+                         [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]])
+            return
+        if not (1 <= quota <= 100):
+            await render(context, chat_id, message_id,
+                         "❌ Range: 1-100 accounts.",
+                         [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]])
+            return
+        
+        pending = _pending_lic_gen.pop(user_id, {})
+        duration = pending.get("duration", "30")
+        user_sessions.pop(user_id, None)
+        
+        await license_generate_execute(context, chat_id, message_id, user_id, duration, quota)
+
     elif step == "wait_extend_days":
         if not is_super_admin(user_id):
             return
@@ -2657,7 +2704,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             quota_line = ""
             if lic:
                 used = await count_owned_accounts(user_id)
-                quota_line = f"\nKuota akun       : {used}/{lic.max_accounts}"
+                quota_line = f"\nAccount quota       : {used}/{lic.max_accounts}"
             text = (
                 "📊 <b>Stats</b>\n"
                 f"Accounts         : <b>{total}</b>\n"
@@ -2778,11 +2825,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             await license_generate_start(context, chat_id, message_id)
 
+        elif data == "lic_gen_dcustom":
+            if not is_super_admin(user_id):
+                return
+            user_sessions[user_id]["step"] = "wait_custom_days"
+            await render(
+                context, chat_id, message_id,
+                "✏️ Send the number of days for the license (1-3650):",
+                [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]],
+            )
+
         elif data.startswith("lic_gen_d"):
             if not is_super_admin(user_id):
                 return
             await license_generate_quota(context, chat_id, message_id, user_id,
                                         data[len("lic_gen_d"):])
+
+        elif data == "lic_gen_qcustom":
+            if not is_super_admin(user_id):
+                return
+            user_sessions[user_id]["step"] = "wait_custom_quota"
+            await render(
+                context, chat_id, message_id,
+                "✏️ Send the number of account quota (1-100):",
+                [[InlineKeyboardButton("❌ Cancel", callback_data="lic_mgr")]],
+            )
 
         elif data.startswith("lic_gen_q"):
             if not is_super_admin(user_id):
