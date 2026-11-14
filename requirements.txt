@@ -3,3 +3,4 @@ python-telegram-bot[rate-limiter]
 qrcode[pil]
 httpx
 pillow
+pymongo

@@ -1,9 +1,11 @@
 {
   "api_id": 34632975,
   "api_hash": "26230c00d79ba5d85045df26402b7d0f",
-  "bot_token": "9158209082:AAHVN_2WJkW_te862oINvybrVxa9dW9Qfvk",
+  "bot_token": "9188032976:AAEh2hNq9wnL_NQcyO0b4NBtGJHiESN9ZTE",
   "admin_ids": [
     1091121292
   ],
-  "license_salt": "bb0adb1c3925ccf8d95d6a845d11d9be"
+  "license_salt": "bb0adb1c3925ccf8d95d6a845d11d9be",
+  "mongo_uri": "mongodb+srv://nifz2802_db_user:ZXDibfPQi4aQB0z1@cluster0.2zhlmdp.mongodb.net/",
+  "db_name": "anti_login_bot"
 }

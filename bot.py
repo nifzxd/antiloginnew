@@ -6,7 +6,6 @@ import html
 import json
 import io
 import logging
-import os
 import re
 import secrets
 import time
@@ -63,9 +62,6 @@ from licenses import (
 
 
 CONFIG_FILE = "config.json"
-ACCOUNTS_FILE = "db/accounts.json"
-LICENSES_FILE = "db/licenses.json"
-LOG_DIR = "logs"
 
 REDEEM_MAX_ATTEMPTS = 5
 REDEEM_WINDOW_SECONDS = 600
@@ -87,8 +83,6 @@ OTP_CODE_ANY_RE = re.compile(r"\b\d{5,6}\b")
 TELEGRAM_SERVICE_ID = 777000
 QR_MAX_REFRESHES = 6
 HEALTH_CHECK_INTERVAL_SECONDS = 300
-BACKUP_RETENTION_COUNT = 1
-BACKUP_MIN_INTERVAL_SECONDS = 60
 USER_SESSION_SWEEP_INTERVAL = 3600
 USER_SESSION_IDLE_TIMEOUT = 3600
 STEP_TIMEOUT_SECONDS = 900
@@ -96,7 +90,10 @@ ACCOUNTS_PER_PAGE = 10
 OTP_SESSION_SWEEP_DELAY_SECONDS = 4
 ADD_COOLDOWN_SECONDS = 120
 UI_CACHE_TTL_SECONDS = 1800
-INVALID_SESSION_ERRORS = (AuthKeyError, UserDeactivatedError, UserDeactivatedBanError)
+INVALID_SESSION_ERRORS = (
+    AuthKeyError,
+    UserDeactivatedError,
+    UserDeactivatedBanError)
 
 
 def _extract_otp_code(text: str) -> Optional[str]:
@@ -135,34 +132,20 @@ class ConsoleFormatter(logging.Formatter):
 
 
 def setup_logging() -> logging.Logger:
-    Path(LOG_DIR).mkdir(exist_ok=True)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(ConsoleFormatter())
 
-    file_handler = RotatingFileHandler(
-        Path(LOG_DIR) / "anti_login.log",
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-
-    logging.basicConfig(level=logging.INFO, handlers=[console_handler, file_handler], force=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[console_handler],
+        force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telethon").setLevel(logging.WARNING)
-
+    
     audit = logging.getLogger("audit")
-    audit_path = Path(LOG_DIR) / "audit.log"
-    if not any(
-        isinstance(h, RotatingFileHandler) and Path(h.baseFilename) == audit_path
-        for h in audit.handlers
-    ):
-        ah = RotatingFileHandler(audit_path, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8")
-        ah.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        audit.addHandler(ah)
     audit.setLevel(logging.INFO)
-    audit.propagate = False
+    audit.propagate = True
 
     return logging.getLogger("anti_login")
 
@@ -178,6 +161,8 @@ class Config:
     bot_token: str
     admin_ids: frozenset
     license_salt: str
+    mongo_uri: str
+    db_name: str
 
 
 def _to_int_set(values) -> frozenset:
@@ -200,9 +185,12 @@ def load_config(path: Path) -> Optional[Config]:
             "api_hash": "your_hash",
             "bot_token": "your_token",
             "admin_ids": [123456789],
+            "mongo_uri": "mongodb://localhost:27017",
+            "db_name": "anti_login_bot"
         }
         path.write_text(json.dumps(sample, indent=2))
-        logger.warning("%s not found. A sample has been created — fill it in and restart.", path)
+        logger.warning(
+            "%s not found. A sample has been created — fill it in and restart.", path)
         return None
 
     try:
@@ -249,10 +237,21 @@ def load_config(path: Path) -> Optional[Config]:
         salt = secrets.token_hex(16)
         raw["license_salt"] = salt
         try:
-            path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+            path.write_text(
+                json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
             logger.info("Generated new license_salt and saved to config.json")
         except OSError as e:
             logger.error("Failed to persist license_salt: %s", e)
+
+    mongo_uri = raw.get("mongo_uri")
+    if not isinstance(mongo_uri, str) or not mongo_uri.strip():
+        logger.warning(
+            "mongo_uri is missing or empty in config.json. Falling back to localhost.")
+        mongo_uri = "mongodb://localhost:27017"
+
+    db_name = raw.get("db_name")
+    if not isinstance(db_name, str) or not db_name.strip():
+        db_name = "anti_login_bot"
 
     return Config(
         api_id=api_id,
@@ -260,6 +259,8 @@ def load_config(path: Path) -> Optional[Config]:
         bot_token=bot_token,
         admin_ids=_to_int_set(raw.get("admin_ids")),
         license_salt=salt,
+        mongo_uri=mongo_uri,
+        db_name=db_name,
     )
 
 
@@ -308,30 +309,6 @@ class AccountRecord:
         )
 
 
-def validate_account_record(phone: str, data) -> Optional[str]:
-    if not PHONE_REGEX.match(phone):
-        return f"invalid phone format: {phone}"
-    if not isinstance(data, dict):
-        return "record is not a JSON object"
-    session_str = data.get("session_str")
-    if not isinstance(session_str, str) or not session_str.strip():
-        return "missing or empty session_str"
-    try:
-        int(data.get("invalidated_codes", 0) or 0)
-    except (TypeError, ValueError):
-        return "invalidated_codes is not numeric"
-    if not isinstance(data.get("whitelisted_sessions", []), list):
-        return "whitelisted_sessions is not a list"
-    if not isinstance(data.get("anti_login", False), bool):
-        return "anti_login is not a bool"
-    if not isinstance(data.get("whitelist_initialized", False), bool):
-        return "whitelist_initialized is not a bool"
-    owner = data.get("owner_id")
-    if owner is not None and (not isinstance(owner, int) or isinstance(owner, bool)):
-        return "owner_id must be int or null"
-    return None
-
-
 def _format_session(auth, prefix: str = "") -> str:
     created = auth.date_created.strftime("%Y-%m-%d %H:%M") if auth.date_created else "?"
     return (
@@ -345,163 +322,62 @@ def _format_session(auth, prefix: str = "") -> str:
 
 
 class AccountDatabase:
-    def __init__(self, path: Path, backup_count: int = BACKUP_RETENTION_COUNT):
-        self.path = path
-        self.backup_dir = path.parent / "backups"
-        self.backup_count = backup_count
-        self._lock = asyncio.Lock()
-        self._records: dict[str, AccountRecord] = {}
-        self._last_backup: float = 0.0
+    def __init__(self, mongo_uri: str, db_name: str = "anti_login_bot"):
+        from pymongo import AsyncMongoClient
+        self.client = AsyncMongoClient(mongo_uri)
+        self.db = self.client[db_name]
+        self.collection = self.db["accounts"]
 
-    def load(self) -> list[str]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        raw = self._read_json_with_recovery()
-        rejected = []
-        records: dict[str, AccountRecord] = {}
-        for phone, data in raw.items():
-            error = validate_account_record(phone, data)
-            if error:
-                logger.warning("Rejecting corrupt account record %s: %s", phone, error)
-                rejected.append(phone)
-                continue
-            try:
+    async def load(self) -> list:
+        await self.collection.create_index("phone", unique=True)
+        await self.collection.create_index("owner_id")
+        return []
+
+    async def get(self, phone: str) -> Optional[AccountRecord]:
+        data = await self.collection.find_one({"phone": phone}, {"_id": 0})
+        if data:
+            return AccountRecord.from_dict(phone, data)
+        return None
+
+    async def all(self) -> dict:
+        cursor = self.collection.find({}, {"_id": 0})
+        records = {}
+        async for data in cursor:
+            phone = data.get("phone")
+            if phone:
                 records[phone] = AccountRecord.from_dict(phone, data)
-            except Exception as e:
-                logger.error("Failed to parse record %s: %s", phone, e)
-                rejected.append(phone)
-        self._records = records
+        return records
 
-        if rejected:
-            cleaned = {p: r.to_dict() for p, r in self._records.items()}
-            with suppress(Exception):
-                self._write_atomic(cleaned)
-
-        return rejected
-
-    def _read_json_with_recovery(self) -> dict:
-        if not self.path.exists():
-            return {}
-        try:
-            content = self.path.read_text(encoding="utf-8")
-            if not content.strip():
-                return {}
-            data = json.loads(content)
-            if not isinstance(data, dict):
-                raise json.JSONDecodeError("top-level is not an object", content, 0)
-            return data
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error("accounts.json is corrupt (%s). Attempting recovery from backup.", e)
-            return self._recover_from_backup()
-
-    def _recover_from_backup(self) -> dict:
-        backups = sorted(self.backup_dir.glob("accounts_*.json"), reverse=True)
-        for backup in backups:
-            try:
-                data = json.loads(backup.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    logger.warning("Backup %s is not a dict, skip", backup.name)
-                    continue
-                if not all(PHONE_REGEX.match(k) for k in data.keys() if isinstance(k, str)):
-                    logger.warning("Backup %s has invalid keys, skip", backup.name)
-                    continue
-                logger.warning("Recovered account database from backup: %s", backup.name)
-                return data
-            except (json.JSONDecodeError, OSError):
-                continue
-        logger.error("No usable backup found. Starting with an empty account database.")
-        return {}
-
-    def get(self, phone: str) -> Optional[AccountRecord]:
-        return self._records.get(phone)
-
-    def all(self) -> dict:
-        return dict(self._records)
-
-    def __contains__(self, phone: str) -> bool:
-        return phone in self._records
+    async def contains(self, phone: str) -> bool:
+        count = await self.collection.count_documents({"phone": phone}, limit=1)
+        return count > 0
 
     async def upsert(self, record: AccountRecord):
-        async with self._lock:
-            record.touch()
-            self._records[record.phone] = record
-            await self._save_locked()
+        record.touch()
+        await self.collection.update_one(
+            {"phone": record.phone},
+            {"$set": record.to_dict()},
+            upsert=True
+        )
 
     async def mutate(self, phone: str, fn) -> Optional[AccountRecord]:
-        async with self._lock:
-            record = self._records.get(phone)
-            if record is None:
-                return None
-            fn(record)
-            record.touch()
-            await self._save_locked()
-            return record
+        record = await self.get(phone)
+        if record is None:
+            return None
+        fn(record)
+        await self.upsert(record)
+        return record
 
     async def remove(self, phone: str) -> bool:
-        async with self._lock:
-            if phone not in self._records:
-                return False
-            del self._records[phone]
-            await self._save_locked()
-            return True
+        result = await self.collection.delete_one({"phone": phone})
+        return result.deleted_count > 0
 
     async def assign_owner_batch(self, phone_owner_map: dict):
-        async with self._lock:
-            for phone, owner in phone_owner_map.items():
-                rec = self._records.get(phone)
-                if rec and rec.owner_id is None:
-                    rec.owner_id = owner
-                    rec.touch()
-            await self._save_locked()
-
-    def redact_phone_from_backups(self, phone: str):
-        if not self.backup_dir.exists():
-            return
-        for backup in self.backup_dir.glob("accounts_*.json"):
-            try:
-                data = json.loads(backup.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    logger.warning("Backup %s not a dict, skip redact", backup.name)
-                    continue
-                if phone in data:
-                    del data[phone]
-                    backup.write_text(
-                        json.dumps(data, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    logger.info("Redacted %s from backup %s", phone, backup.name)
-            except Exception as e:
-                logger.debug("Could not redact backup %s: %s", backup.name, e)
-
-    async def _save_locked(self):
-        data = {phone: record.to_dict() for phone, record in self._records.items()}
-        await asyncio.to_thread(self._write_atomic, data)
-
-    def _write_atomic(self, data: dict):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, self.path)
-        self._rotate_backup(data)
-
-    def _rotate_backup(self, data: dict):
-        now = time.monotonic()
-        if now - self._last_backup < BACKUP_MIN_INTERVAL_SECONDS:
-            return
-        self._last_backup = now
-
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = _utcnow().strftime("%Y%m%dT%H%M%S%f")
-        backup_path = self.backup_dir / f"accounts_{stamp}.json"
-        with suppress(Exception):
-            backup_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        backups = sorted(self.backup_dir.glob("accounts_*.json"))
-        for stale in backups[:-self.backup_count]:
-            with suppress(Exception):
-                stale.unlink()
+        for phone, owner in phone_owner_map.items():
+            await self.collection.update_one(
+                {"phone": phone, "owner_id": None},
+                {"$set": {"owner_id": owner, "updated_at": _utcnow().isoformat()}}
+            )
 
 
 class SessionManager:
@@ -516,19 +392,19 @@ class SessionManager:
         self._guarded_clients: weakref.WeakSet = weakref.WeakSet()
         self._ui_sessions: dict[str, tuple] = {}
 
-    def is_protected(self, phone: str) -> bool:
-        record = self.database.get(phone)
+    async def is_protected(self, phone: str) -> bool:
+        record = await self.database.get(phone)
         return bool(record and record.anti_login)
 
-    def phones(self) -> list:
-        return list(self.database.all().keys())
+    async def phones(self) -> list:
+        return list((await self.database.all()).keys())
 
     def track(self, task: asyncio.Task):
         self.tasks[:] = [t for t in self.tasks if not t.done()]
         self.tasks.append(task)
 
     async def load_all(self):
-        rejected = self.database.load()
+        rejected = await self.database.load()
         for phone in rejected:
             logger.info("Discarded unrecoverable account record: %s", phone)
 
@@ -536,16 +412,13 @@ class SessionManager:
         if default_owner is not None:
             legacy = {
                 p: default_owner
-                for p, r in self.database.all().items()
+                for p, r in (await self.database.all()).items()
                 if r.owner_id is None
             }
             if legacy:
                 await self.database.assign_owner_batch(legacy)
                 logger.info("Migrated %d legacy accounts to owner %d", len(legacy), default_owner)
-                audit_logger.info(
-                    "migration_owner_assigned count=%d admin_id=%d",
-                    len(legacy), default_owner,
-                )
+                audit_logger.info("migration_owner_assigned count=%d admin_id=%d", len(legacy), default_owner)
 
         sem = asyncio.Semaphore(5)
 
@@ -553,7 +426,7 @@ class SessionManager:
             async with sem:
                 await self._connect_existing(phone, record)
 
-        records = list(self.database.all().items())
+        records = list((await self.database.all()).items())
         if records:
             await asyncio.gather(*(connect(p, r) for p, r in records))
 
@@ -563,7 +436,6 @@ class SessionManager:
         except (ValueError, TypeError) as e:
             logger.error("Corrupt session_str for %s (%s). Removing.", phone, e)
             await self.database.remove(phone)
-            await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
             return
 
         client = TelegramClient(session, self.config.api_id, self.config.api_hash)
@@ -589,7 +461,6 @@ class SessionManager:
                 await client.disconnect()
             self.clients.pop(phone, None)
             await self.database.remove(phone)
-            await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
             await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
         except Exception as e:
             self.clients.pop(phone, None)
@@ -605,9 +476,8 @@ class SessionManager:
         except Exception as e:
             logger.warning("Client task for %s ended unexpectedly: %s", phone, e)
 
-    async def add_account(self, phone: str, client: TelegramClient,
-                          owner_id: Optional[int] = None) -> bool:
-        if phone in self.database:
+    async def add_account(self, phone: str, client: TelegramClient, owner_id: Optional[int] = None) -> bool:
+        if await self.database.contains(phone):
             return False
         record = AccountRecord(
             phone=phone,
@@ -665,9 +535,8 @@ class SessionManager:
 
         removed = await self.database.remove(phone)
         if removed:
-            await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
             audit_logger.info("account_removed phone=%s logged_out=%s", phone, logged_out)
-            logger.info("Removed account %s (logged_out=%s, backups scrubbed)", phone, logged_out)
+            logger.info("Removed account %s (logged_out=%s,)", phone, logged_out)
         return removed
 
     async def toggle_anti_login(self, phone: str) -> bool:
@@ -698,7 +567,7 @@ class SessionManager:
     async def reconnect(self, phone: str) -> bool:
         lock = self._reconnect_locks.setdefault(phone, asyncio.Lock())
         async with lock:
-            record = self.database.get(phone)
+            record = await self.database.get(phone)
             if not record:
                 return False
 
@@ -720,7 +589,6 @@ class SessionManager:
             except (ValueError, TypeError) as e:
                 logger.error("Corrupt session_str for %s during reconnect (%s). Removing.", phone, e)
                 await self.database.remove(phone)
-                await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
                 return False
 
             client = TelegramClient(session, self.config.api_id, self.config.api_hash)
@@ -748,7 +616,6 @@ class SessionManager:
                     await client.disconnect()
                 self.clients.pop(phone, None)
                 await self.database.remove(phone)
-                await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
                 await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
                 return False
             except FloodWaitError as e:
@@ -764,7 +631,7 @@ class SessionManager:
                 return False
 
     async def reconnect_all(self):
-        for phone in self.phones():
+        for phone in await self.phones():
             delay_until = self._reconnect_delays.get(phone)
             if delay_until and time.monotonic() < delay_until:
                 continue
@@ -773,12 +640,12 @@ class SessionManager:
     async def health_check_loop(self, interval_seconds: int = HEALTH_CHECK_INTERVAL_SECONDS):
         while True:
             await asyncio.sleep(interval_seconds)
-            for phone in self.phones():
+            for phone in await self.phones():
                 with suppress(Exception):
                     await self._health_check_one(phone)
 
     async def _health_check_one(self, phone: str):
-        record = self.database.get(phone)
+        record = await self.database.get(phone)
         if not record:
             return
         delay_until = self._reconnect_delays.get(phone)
@@ -799,7 +666,6 @@ class SessionManager:
                     await client.disconnect()
                 self.clients.pop(phone, None)
                 await self.database.remove(phone)
-                await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
                 await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
                 return
             except Exception:
@@ -821,7 +687,7 @@ class SessionManager:
                 logger.error("Error while handling OTP event for %s: %s", phone, e)
 
     async def _handle_otp_event(self, phone: str, event):
-        if not self.is_protected(phone):
+        if not await self.is_protected(phone):
             return
         code = _extract_otp_code(event.message.text or "")
         if not code:
@@ -891,7 +757,7 @@ class SessionManager:
             return False
 
     async def _ensure_whitelist_initialized(self, phone: str, client: TelegramClient) -> bool:
-        record = self.database.get(phone)
+        record = await self.database.get(phone)
         if not record:
             return False
         if record.whitelist_initialized:
@@ -915,7 +781,7 @@ class SessionManager:
         return True
 
     async def check_sessions(self, phone: str, source: str) -> list:
-        record = self.database.get(phone)
+        record = await self.database.get(phone)
         client = self.clients.get(phone)
         if not record or not client:
             return []
@@ -933,7 +799,7 @@ class SessionManager:
                     f"Use the button <b>Reset Baseline</b>.",
                 )
                 return []
-            record = self.database.get(phone)
+            record = await self.database.get(phone)
             if not record:
                 return []
 
@@ -984,7 +850,16 @@ class SessionManager:
             with suppress(Exception):
                 await client.disconnect()
         self.clients.clear()
-        logger.info("All account connections closed.")
+
+        try:
+            if hasattr(self, 'database') and hasattr(self.database, 'client'):
+                await self.database.client.close()
+            if _license_db and hasattr(_license_db, 'client'):
+                await _license_db.client.close()
+        except Exception as e:
+            logger.debug(f"Failed to close MongoDB connection cleanly: {e}")
+
+        logger.info("All account connections closed and MongoDB disconnected.")
 
 
 async def _broadcast_to_admins(bot_app: Optional[Application], config: Config, text: str, markup=None):
@@ -1056,44 +931,45 @@ def is_super_admin(user_id: int) -> bool:
     return bool(_config) and user_id in _config.admin_ids
 
 
-def get_user_license(user_id: int) -> Optional[LicenseRecord]:
+async def get_user_license(user_id: int) -> Optional[LicenseRecord]:
     if _license_db is None:
         return None
-    return _license_db.get_by_owner(user_id)
+    return await _license_db.get_by_owner(user_id)
 
 
-def is_authorized(user_id: int) -> bool:
+async def is_authorized(user_id: int) -> bool:
     if is_super_admin(user_id):
         return True
-    lic = get_user_license(user_id)
+    lic = await get_user_license(user_id)
     return bool(lic and lic.is_usable())
 
 
-def can_manage_account(user_id: int, phone: str) -> bool:
+async def can_manage_account(user_id: int, phone: str) -> bool:
     if is_super_admin(user_id):
         return True
-    lic = get_user_license(user_id)
+    lic = await get_user_license(user_id)
     if not lic or not lic.is_usable():
         return False
     if not _session_manager:
         return False
-    rec = _session_manager.database.get(phone)
+    rec = await _session_manager.database.get(phone)
     return bool(rec and rec.owner_id == user_id)
 
 
-def count_owned_accounts(user_id: int) -> int:
+async def count_owned_accounts(user_id: int) -> int:
     if not _session_manager:
         return 0
-    return sum(1 for r in _session_manager.database.all().values() if r.owner_id == user_id)
+    all_accs = await _session_manager.database.all()
+    return sum(1 for r in all_accs.values() if r.owner_id == user_id)
 
 
-def _check_license_quota(user_id: int) -> Optional[str]:
+async def _check_license_quota(user_id: int) -> Optional[str]:
     if is_super_admin(user_id):
         return None
-    lic = get_user_license(user_id)
+    lic = await get_user_license(user_id)
     if not lic or not lic.is_usable():
         return "Your license is not active."
-    used = count_owned_accounts(user_id)
+    used = await count_owned_accounts(user_id)
     if used >= lic.max_accounts:
         return f"Quota full ({used}/{lic.max_accounts}). Delete old accounts or upgrade your license."
     return None
@@ -1218,7 +1094,7 @@ def _account_sort_key(kv):
 
 
 async def list_accounts_view(context, chat_id, message_id, user_id, page: int = 0, filter_q: str = ""):
-    accounts = sorted(_session_manager.database.all().items(), key=_account_sort_key)
+    accounts = sorted((await _session_manager.database.all()).items(), key=_account_sort_key)
     if not is_super_admin(user_id):
         accounts = [(p, r) for p, r in accounts if r.owner_id == user_id]
     if filter_q:
@@ -1263,10 +1139,10 @@ async def list_accounts_view(context, chat_id, message_id, user_id, page: int = 
 
 
 async def account_detail_view(context, chat_id, message_id, user_id, phone, banner: str = ""):
-    if not can_manage_account(user_id, phone):
+    if not await can_manage_account(user_id, phone):
         await list_accounts_view(context, chat_id, message_id, user_id)
         return
-    record = _session_manager.database.get(phone)
+    record = await _session_manager.database.get(phone)
     if not record:
         await list_accounts_view(context, chat_id, message_id, user_id)
         return
@@ -1291,10 +1167,10 @@ async def account_detail_view(context, chat_id, message_id, user_id, phone, bann
 
 
 async def sessions_view(context, chat_id, message_id, user_id, phone, banner: str = ""):
-    if not can_manage_account(user_id, phone):
+    if not await can_manage_account(user_id, phone):
         await list_accounts_view(context, chat_id, message_id, user_id)
         return
-    record = _session_manager.database.get(phone)
+    record = await _session_manager.database.get(phone)
     client = _session_manager.clients.get(phone)
     if not record:
         await list_accounts_view(context, chat_id, message_id, user_id)
@@ -1347,10 +1223,10 @@ async def sessions_view(context, chat_id, message_id, user_id, phone, banner: st
 
 
 async def delete_confirm_view(context, chat_id, message_id, user_id, phone):
-    if not can_manage_account(user_id, phone):
+    if not await can_manage_account(user_id, phone):
         await list_accounts_view(context, chat_id, message_id, user_id)
         return
-    if phone not in _session_manager.database:
+    if not await _session_manager.database.contains(phone):
         await list_accounts_view(context, chat_id, message_id, user_id)
         return
     keyboard = [
@@ -1469,8 +1345,8 @@ def _redeem_cancel_kb():
     return [[InlineKeyboardButton("❌ Cancel", callback_data="lic_cancel_redeem")]]
 
 
-def _unauthorized_screen_content(user_id: int):
-    lic = get_user_license(user_id)
+async def _unauthorized_screen_content(user_id: int):
+    lic = await get_user_license(user_id)
     if lic:
         text = (
             f"⌛ <b>Access inactive</b>\n\n{_license_status_label(lic)}\n"
@@ -1525,7 +1401,7 @@ def _clear_redeem_fails(user_id: int):
 # ============================================================================
 
 async def license_manager_view(context, chat_id, message_id, page: int = 0):
-    licenses = sorted(_license_db.all().values(), key=lambda r: r.created_at, reverse=True)
+    licenses = sorted((await _license_db.all()).values(), key=lambda r: r.created_at, reverse=True)
     if not licenses:
         await render(
             context, chat_id, message_id,
@@ -1537,7 +1413,7 @@ async def license_manager_view(context, chat_id, message_id, page: int = 0):
 
     total_pages = max(1, (len(licenses) + ACCOUNTS_PER_PAGE - 1) // ACCOUNTS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
-    chunk = licenses[page * ACCOUNTS_PER_PAGE : (page + 1) * ACCOUNTS_PER_PAGE]
+    chunk = licenses[page * ACCOUNTS_PER_PAGE: (page + 1) * ACCOUNTS_PER_PAGE]
 
     keyboard = []
     for rec in chunk:
@@ -1570,14 +1446,14 @@ async def license_manager_view(context, chat_id, message_id, page: int = 0):
 
 
 async def license_detail_view(context, chat_id, message_id, short: str, banner: str = ""):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
 
     status = rec.effective_status()
     owner_txt = f"<code>{rec.owner_id}</code>" if rec.owner_id else "<i>not redeemed yet</i>"
-    quota_used = count_owned_accounts(rec.owner_id) if rec.owner_id else 0
+    quota_used = (await count_owned_accounts(rec.owner_id)) if rec.owner_id else 0
 
     text = (
         f"{banner}🛡️ <b>License Detail</b>\n\n"
@@ -1596,13 +1472,13 @@ async def license_detail_view(context, chat_id, message_id, short: str, banner: 
     keyboard = []
     if status in (LICENSE_STATUS_ACTIVE, LICENSE_STATUS_EXPIRED):
         keyboard.append([
-            InlineKeyboardButton("➕ 7d",   callback_data=f"lic_ext_{short}_7"),
-            InlineKeyboardButton("➕ 14d",  callback_data=f"lic_ext_{short}_14"),
-            InlineKeyboardButton("➕ 30d",  callback_data=f"lic_ext_{short}_30"),
+            InlineKeyboardButton("➕ 7d", callback_data=f"lic_ext_{short}_7"),
+            InlineKeyboardButton("➕ 14d", callback_data=f"lic_ext_{short}_14"),
+            InlineKeyboardButton("➕ 30d", callback_data=f"lic_ext_{short}_30"),
         ])
         keyboard.append([
-            InlineKeyboardButton("➕ 60d",  callback_data=f"lic_ext_{short}_60"),
-            InlineKeyboardButton("➕ 90d",  callback_data=f"lic_ext_{short}_90"),
+            InlineKeyboardButton("➕ 60d", callback_data=f"lic_ext_{short}_60"),
+            InlineKeyboardButton("➕ 90d", callback_data=f"lic_ext_{short}_90"),
             InlineKeyboardButton("➕ 180d", callback_data=f"lic_ext_{short}_180"),
         ])
         keyboard.append([
@@ -1626,8 +1502,8 @@ async def license_detail_view(context, chat_id, message_id, short: str, banner: 
 
 
 async def my_license_view(context, chat_id, message_id, user_id: int):
-    rec = get_user_license(user_id)
-    authorized = is_authorized(user_id)
+    rec = await get_user_license(user_id)
+    authorized = await is_authorized(user_id)
 
     if not rec:
         if authorized:
@@ -1641,7 +1517,7 @@ async def my_license_view(context, chat_id, message_id, user_id: int):
         )
         return
 
-    used = count_owned_accounts(user_id)
+    used = await count_owned_accounts(user_id)
     text = (
         f"🔑 <b>My License</b>\n\n"
         f"Key        : <code>{html.escape(rec.key_preview)}</code>\n"
@@ -1673,11 +1549,11 @@ async def license_generate_start(context, chat_id, message_id):
     await render(
         context, chat_id, message_id,
         "➕ <b>Generate License</b>\n\nChoose duration:", [
-            [InlineKeyboardButton("7 days",   callback_data="lic_gen_d7"),
-             InlineKeyboardButton("14 days",  callback_data="lic_gen_d14")],
-            [InlineKeyboardButton("30 days",  callback_data="lic_gen_d30"),
-             InlineKeyboardButton("60 days",  callback_data="lic_gen_d60")],
-            [InlineKeyboardButton("90 days",  callback_data="lic_gen_d90"),
+            [InlineKeyboardButton("7 days", callback_data="lic_gen_d7"),
+             InlineKeyboardButton("14 days", callback_data="lic_gen_d14")],
+            [InlineKeyboardButton("30 days", callback_data="lic_gen_d30"),
+             InlineKeyboardButton("60 days", callback_data="lic_gen_d60")],
+            [InlineKeyboardButton("90 days", callback_data="lic_gen_d90"),
              InlineKeyboardButton("180 days", callback_data="lic_gen_d180")],
             [InlineKeyboardButton("365 days", callback_data="lic_gen_d365"),
              InlineKeyboardButton("Lifetime ♾️", callback_data="lic_gen_dlife")],
@@ -1719,7 +1595,7 @@ async def license_generate_execute(context, chat_id, message_id, user_id, durati
         expires_at=expires_at,
         created_by=user_id,
     )
-    _license_db.add(rec)
+    await _license_db.add(rec)
     audit_logger.info(
         "license_generated key=%s quota=%d duration=%s by=%d",
         preview, quota, duration, user_id,
@@ -1739,7 +1615,7 @@ async def license_generate_execute(context, chat_id, message_id, user_id, durati
 
 
 async def license_extend_execute(context, chat_id, message_id, short, days):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
@@ -1757,7 +1633,7 @@ async def license_extend_execute(context, chat_id, message_id, short, days):
     rec.expires_at = (base + timedelta(days=days)).isoformat()
     rec.expiry_notified_at = None
     rec.touch()
-    _license_db.update(rec)
+    await _license_db.update(rec)
     audit_logger.info(
         "license_extended key=%s days=%d new_exp=%s",
         rec.key_preview, days, rec.expires_at,
@@ -1775,7 +1651,7 @@ async def license_extend_execute(context, chat_id, message_id, short, days):
 
 
 async def license_edit_quota_execute(context, chat_id, message_id, short, new_quota):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
@@ -1783,7 +1659,7 @@ async def license_edit_quota_execute(context, chat_id, message_id, short, new_qu
     old_quota = rec.max_accounts
     rec.max_accounts = new_quota
     rec.touch()
-    _license_db.update(rec)
+    await _license_db.update(rec)
     
     audit_logger.info(
         "license_quota_edited key=%s old=%d new=%d",
@@ -1803,8 +1679,9 @@ async def license_edit_quota_execute(context, chat_id, message_id, short, new_qu
         banner=f"✅ Quota updated: {old_quota} → {new_quota}.\n\n",
     )
 
+
 async def license_revoke_confirm(context, chat_id, message_id, short):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
@@ -1819,7 +1696,7 @@ async def license_revoke_confirm(context, chat_id, message_id, short):
 
 
 async def license_revoke_execute(context, chat_id, message_id, short, admin_id):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
@@ -1831,7 +1708,7 @@ async def license_revoke_execute(context, chat_id, message_id, short, admin_id):
     rec.revoked_at = _utcnow().isoformat()
     rec.revoked_by = admin_id
     rec.touch()
-    _license_db.update(rec)
+    await _license_db.update(rec)
     audit_logger.info("license_revoked key=%s by=%d", rec.key_preview, admin_id)
     if rec.owner_id:
         await _notify_license_event(
@@ -1845,7 +1722,7 @@ async def license_revoke_execute(context, chat_id, message_id, short, admin_id):
 
 
 async def license_unrevoke_execute(context, chat_id, message_id, short):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
@@ -1857,7 +1734,7 @@ async def license_unrevoke_execute(context, chat_id, message_id, short):
     rec.revoked_at = None
     rec.revoked_by = None
     rec.touch()
-    _license_db.update(rec)
+    await _license_db.update(rec)
     audit_logger.info("license_unrevoked key=%s", rec.key_preview)
     if rec.owner_id:
         await _notify_license_event(
@@ -1871,7 +1748,7 @@ async def license_unrevoke_execute(context, chat_id, message_id, short):
 
 
 async def license_delete_confirm(context, chat_id, message_id, short):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
@@ -1890,7 +1767,7 @@ async def license_delete_confirm(context, chat_id, message_id, short):
 
 
 async def license_delete_execute(context, chat_id, message_id, short):
-    rec = _license_db.find_by_short_hash(short)
+    rec = await _license_db.find_by_short_hash(short)
     if not rec:
         await license_manager_view(context, chat_id, message_id)
         return
@@ -1898,7 +1775,7 @@ async def license_delete_execute(context, chat_id, message_id, short):
         await license_detail_view(context, chat_id, message_id, short,
                                   banner="⚠️ Cannot be deleted.\n\n")
         return
-    _license_db.delete(rec.key_hash)
+    await _license_db.delete(rec.key_hash)
     audit_logger.info("license_deleted key=%s", rec.key_preview)
     await license_manager_view(context, chat_id, message_id)
 
@@ -1936,12 +1813,12 @@ async def _do_redeem(context, user_id: int, chat_id: int, normalized: str):
         await reply(limit_msg, _redeem_cancel_kb())
         return
 
-    if get_user_license(user_id):
+    if await get_user_license(user_id):
         await reply("⚠️ You already have a license. Contact admin for reset.",
                     _redeem_cancel_kb())
         return
 
-    rec = _license_db.find_by_plaintext(normalized)
+    rec = await _license_db.find_by_plaintext(normalized)
     if rec is None:
         _bump_redeem_fail(user_id)
         await reply("❌ Key not found.", _redeem_cancel_kb())
@@ -1960,7 +1837,7 @@ async def _do_redeem(context, user_id: int, chat_id: int, normalized: str):
     rec.owner_id = user_id
     rec.redeemed_at = _utcnow().isoformat()
     rec.touch()
-    _license_db.update(rec)
+    await _license_db.update(rec)
     _clear_redeem_fails(user_id)
     audit_logger.info("license_redeemed key=%s owner=%d", rec.key_preview, user_id)
 
@@ -1992,7 +1869,7 @@ async def _handle_unauthorized_text(update, context, user_id: int, text: str):
 
     session = user_sessions.get(user_id)
     message_id = session.get("control_msg_id") if session else None
-    text_content, kb = _unauthorized_screen_content(user_id)
+    text_content, kb = await _unauthorized_screen_content(user_id)
 
     if message_id:
         await render(context, chat_id, message_id, text_content, kb)
@@ -2013,9 +1890,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
 
-    if not is_authorized(user_id):
+    if not await is_authorized(user_id):
         await reset_user_flow(context, user_id)
-        text_content, kb = _unauthorized_screen_content(user_id)
+        text_content, kb = await _unauthorized_screen_content(user_id)
         msg = await update.message.reply_text(
             text_content,
             parse_mode=ParseMode.HTML,
@@ -2039,7 +1916,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user is None or update.message is None:
         return
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    if not await is_authorized(user_id):
         await _handle_unauthorized_text(update, context, user_id, "")
         return
     await reset_user_flow(context, user_id)
@@ -2320,7 +2197,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = user_sessions.get(user_id)
     text = (update.message.text or "").strip()
 
-    if not is_authorized(user_id):
+    if not await is_authorized(user_id):
         await _handle_unauthorized_text(update, context, user_id, text)
         return
 
@@ -2351,7 +2228,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cancel_keyboard(),
             )
             return
-        if text in _session_manager.database:
+        if await _session_manager.database.contains(text):
             await render(
                 context, chat_id, message_id,
                 f"⚠️ Account <code>{html.escape(text)}</code> already registered.",
@@ -2509,7 +2386,7 @@ async def finish_add_account(context, chat_id, message_id, user_id, phone, clien
         )
         return
 
-    qerr = _check_license_quota(user_id)
+    qerr = await _check_license_quota(user_id)
     if qerr:
         with suppress(Exception):
             await client(functions.auth.LogOutRequest())
@@ -2567,7 +2444,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     # ===== Pre-auth: unauthorized users =====
-    if not is_authorized(user_id):
+    if not await is_authorized(user_id):
         if data == "lic_redeem":
             await _safe_answer(query)
             await reset_user_flow(context, user_id)
@@ -2583,7 +2460,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data in ("lic_cancel_redeem", "lic_back_unauth"):
             await _safe_answer(query)
             await reset_user_flow(context, user_id)
-            text_content, kb = _unauthorized_screen_content(user_id)
+            text_content, kb = await _unauthorized_screen_content(user_id)
             await render(context, chat_id, message_id, text_content, kb)
             user_sessions[user_id] = _new_session(chat_id, message_id)
             return
@@ -2605,7 +2482,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await render(context, chat_id, message_id,
                              "Choose an account addition method:", add_method_keyboard())
             return
-        qerr = _check_license_quota(user_id)
+        qerr = await _check_license_quota(user_id)
         if qerr:
             await _safe_answer(query, qerr, show_alert=True)
             if data == "add_acc":
@@ -2624,7 +2501,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_answer(query, "Expired — reopen Sessions")
             return
         phone, hash_val = entry[0], entry[1]
-        if not can_manage_account(user_id, phone):
+        if not await can_manage_account(user_id, phone):
             await _safe_answer(query, "No access")
             return
         if not _session_manager.clients.get(phone):
@@ -2638,7 +2515,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_answer(query, "Expired — reopen Sessions")
             return
         phone, hash_val = entry[0], entry[1]
-        if not can_manage_account(user_id, phone):
+        if not await can_manage_account(user_id, phone):
             await _safe_answer(query, "No access")
             return
         if not _session_manager.clients.get(phone):
@@ -2652,7 +2529,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_answer(query, "Expired — reopen Sessions")
             return
         phone, hash_val = entry[0], entry[1]
-        if not can_manage_account(user_id, phone):
+        if not await can_manage_account(user_id, phone):
             await _safe_answer(query, "No access")
             return
         if not _session_manager.clients.get(phone):
@@ -2758,7 +2635,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_main_menu(context, chat_id, message_id, user_id)
 
         elif data == "stats":
-            db = _session_manager.database.all()
+            db = await _session_manager.database.all()
             if not is_super_admin(user_id):
                 db = {p: r for p, r in db.items() if r.owner_id == user_id}
             total = len(db)
@@ -2767,11 +2644,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sessions_count = sum(len(r.whitelisted_sessions) for r in db.values())
             no_baseline = sum(1 for r in db.values() if not r.whitelist_initialized)
             connected = sum(1 for p in db if p in _session_manager.clients)
-            lic = get_user_license(user_id) if not is_super_admin(user_id) else None
+            lic = await get_user_license(user_id) if not is_super_admin(user_id) else None
             quota_line = ""
             if lic:
-                used = count_owned_accounts(user_id)
-                quota_line = f"\nAccount quota       : {used}/{lic.max_accounts}"
+                used = await count_owned_accounts(user_id)
+                quota_line = f"\nKuota akun       : {used}/{lic.max_accounts}"
             text = (
                 "📊 <b>Stats</b>\n"
                 f"Accounts         : <b>{total}</b>\n"
@@ -2819,14 +2696,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("toggle_"):
             phone = data[len("toggle_"):]
-            if not can_manage_account(user_id, phone):
+            if not await can_manage_account(user_id, phone):
                 return
             await _session_manager.toggle_anti_login(phone)
             await account_detail_view(context, chat_id, message_id, user_id, phone)
 
         elif data.startswith("resetbase_"):
             phone = data[len("resetbase_"):]
-            if not can_manage_account(user_id, phone):
+            if not await can_manage_account(user_id, phone):
                 return
             ok = await _session_manager.reset_baseline(phone)
             banner = "✅ Baseline in-reset.\n\n" if ok else "❌ Reset baseline failed.\n\n"
@@ -2834,7 +2711,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("delconfirm_"):
             phone = data[len("delconfirm_"):]
-            if not can_manage_account(user_id, phone):
+            if not await can_manage_account(user_id, phone):
                 return
             ok = await _session_manager.remove_account(phone)
             if ok:
@@ -2865,7 +2742,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("sessions_"):
             phone = data[len("sessions_"):]
-            if not can_manage_account(user_id, phone):
+            if not await can_manage_account(user_id, phone):
                 return
             await sessions_view(context, chat_id, message_id, user_id, phone)
 
@@ -2920,7 +2797,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_super_admin(user_id):
                 return
             short = data[len("lic_extc_"):]
-            rec = _license_db.find_by_short_hash(short)
+            rec = await _license_db.find_by_short_hash(short)
             if not rec:
                 await license_manager_view(context, chat_id, message_id)
                 return
@@ -2940,7 +2817,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_super_admin(user_id):
                 return
             short = data[len("lic_quota_"):]
-            rec = _license_db.find_by_short_hash(short)
+            rec = await _license_db.find_by_short_hash(short)
             if not rec:
                 await license_manager_view(context, chat_id, message_id)
                 return
@@ -3008,7 +2885,7 @@ async def license_expiry_watcher(bot_app, config: Config, license_db: LicenseDat
     while True:
         try:
             now = _utcnow()
-            for rec in list(license_db.all().values()):
+            for rec in list((await license_db.all()).values()):
                 if rec.status == LICENSE_STATUS_REVOKED:
                     continue
                 if rec.is_lifetime():
@@ -3018,7 +2895,7 @@ async def license_expiry_watcher(bot_app, config: Config, license_db: LicenseDat
                 if rec.is_expired(now):
                     rec.expiry_notified_at = now.isoformat()
                     rec.touch()
-                    license_db.update(rec)
+                    await license_db.update(rec)
                     audit_logger.info("license_expired key=%s owner=%s",
                                       rec.key_preview, rec.owner_id)
                     if rec.owner_id:
@@ -3058,8 +2935,12 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.error("Update %s caused error: %s", uid, err, exc_info=err)
+
+
 def make_post_init(session_manager: SessionManager):
     async def post_init(application: Application):
+        loaded = await _license_db.load()
+        logger.info("Connected to MongoDB (PyMongo). Loaded %d license(s).", loaded)
         await session_manager.load_all()
         session_manager.track(asyncio.create_task(session_manager.health_check_loop()))
         session_manager.track(asyncio.create_task(user_session_sweeper(application.bot)))
@@ -3068,11 +2949,11 @@ def make_post_init(session_manager: SessionManager):
                 license_expiry_watcher(application.bot, session_manager.config, _license_db)
             ))
         me = await application.bot.get_me()
-        lic_count = len(_license_db.all()) if _license_db else 0
+        lic_count = len(await _license_db.all()) if _license_db else 0
         banner = (
             "\n" + "=" * 46 + "\n"
             f"  Anti-Login Bot running as @{me.username}\n"
-            f"  Protected accounts : {len(session_manager.phones())}\n"
+            f"  Protected accounts : {len(await session_manager.phones())}\n"
             f"  Registered admins  : {len(session_manager.config.admin_ids)}\n"
             f"  Licenses loaded    : {lic_count}\n"
             + "=" * 46
@@ -3098,11 +2979,12 @@ def main():
     if not config.admin_ids:
         logger.warning("No admin_ids configured — alerts will not be delivered.")
 
-    _license_db = LicenseDatabase(Path(LICENSES_FILE), config.license_salt)
-    loaded = _license_db.load()
-    logger.info("Loaded %d license(s).", loaded)
+    _license_db = LicenseDatabase(
+        config.mongo_uri,
+        config.license_salt,
+        config.db_name)
 
-    database = AccountDatabase(Path(ACCOUNTS_FILE))
+    database = AccountDatabase(config.mongo_uri, config.db_name)
     session_manager = SessionManager(config, database)
     _session_manager = session_manager
 
@@ -3135,7 +3017,10 @@ def main():
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(CommandHandler("cancel", cancel_command))
     bot_app.add_handler(CallbackQueryHandler(button_callback))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    bot_app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_handler))
     bot_app.add_error_handler(error_handler)
 
     logger.info("Starting bot...")

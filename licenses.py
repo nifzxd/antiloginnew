@@ -151,135 +151,54 @@ def validate_license_record(data) -> Optional[str]:
 
 
 class LicenseDatabase:
-    def __init__(self, path: Path, salt: str, backup_count: int = 1):
-        self.path = path
+    def __init__(self, mongo_uri: str, salt: str, db_name: str = "anti_login_bot"):
+        from pymongo import AsyncMongoClient
+        self.client = AsyncMongoClient(mongo_uri)
+        self.db = self.client[db_name]
+        self.collection = self.db["licenses"]
         self.salt = salt
-        self.backup_dir = path.parent / "backups"
-        self.backup_count = backup_count
-        self._records: dict[str, LicenseRecord] = {}
-        self._owner_index: dict[int, str] = {}
-        self._last_backup = 0.0
 
-    def load(self) -> int:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        raw = self._read_with_recovery()
-        self._records.clear()
-        self._owner_index.clear()
-        count = 0
-        for key_hash, data in raw.items():
-            err = validate_license_record(data)
-            if err:
-                log.warning("Rejected license record %s: %s", key_hash[:8], err)
-                continue
-            try:
-                rec = LicenseRecord.from_dict(data)
-            except Exception as e:
-                log.error("Failed to parse license %s: %s", key_hash[:8], e)
-                continue
-            self._records[key_hash] = rec
-            if rec.owner_id is not None:
-                self._owner_index[rec.owner_id] = key_hash
-            count += 1
+    async def load(self) -> int:
+        await self.collection.create_index("key_hash", unique=True)
+        await self.collection.create_index("owner_id")
+        count = await self.collection.count_documents({})
         return count
 
-    def _read_with_recovery(self) -> dict:
-        if not self.path.exists():
-            return {}
-        try:
-            content = self.path.read_text(encoding="utf-8")
-            if not content.strip():
-                return {}
-            data = json.loads(content)
-            if not isinstance(data, dict):
-                raise ValueError("not a dict")
-            return data
-        except Exception as e:
-            log.error("licenses.json corrupt (%s). Trying backups.", e)
-            return self._recover_from_backup()
+    def _to_record(self, data: dict) -> LicenseRecord:
+        data.pop("_id", None)
+        return LicenseRecord(**data)
 
-    def _recover_from_backup(self) -> dict:
-        backups = sorted(self.backup_dir.glob("licenses_*.json"), reverse=True)
-        for b in backups:
-            try:
-                data = json.loads(b.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    log.warning("Recovered licenses from %s", b.name)
-                    return data
-            except Exception:
-                continue
-        return {}
+    async def add(self, record: LicenseRecord):
+        await self.collection.insert_one(dataclasses.asdict(record))
 
-    def all(self) -> dict:
-        return dict(self._records)
+    async def update(self, record: LicenseRecord):
+        record.touch()
+        await self.collection.update_one(
+            {"key_hash": record.key_hash},
+            {"$set": dataclasses.asdict(record)}
+        )
 
-    def get_by_hash(self, key_hash: str) -> Optional[LicenseRecord]:
-        return self._records.get(key_hash)
+    async def delete(self, key_hash: str):
+        await self.collection.delete_one({"key_hash": key_hash})
 
-    def get_by_owner(self, owner_id: int) -> Optional[LicenseRecord]:
-        h = self._owner_index.get(owner_id)
-        return self._records.get(h) if h else None
+    async def all(self) -> dict:
+        cursor = self.collection.find({})
+        records = {}
+        async for data in cursor:
+            rec = self._to_record(data)
+            records[rec.key_hash] = rec
+        return records
 
-    def find_by_plaintext(self, key: str) -> Optional[LicenseRecord]:
-        return self._records.get(hash_key(key, self.salt))
+    async def get_by_owner(self, owner_id: int) -> Optional[LicenseRecord]:
+        data = await self.collection.find_one({"owner_id": owner_id})
+        return self._to_record(data) if data else None
 
-    def find_by_short_hash(self, short: str) -> Optional[LicenseRecord]:
-        if not short:
-            return None
-        for h, r in self._records.items():
-            if h.startswith(short):
-                return r
-        return None
+    async def find_by_short_hash(self, short: str) -> Optional[LicenseRecord]:
+        data = await self.collection.find_one({"key_hash": {"$regex": f"^{short}"}})
+        return self._to_record(data) if data else None
 
-    def add(self, record: LicenseRecord) -> None:
-        self._records[record.key_hash] = record
-        if record.owner_id is not None:
-            self._owner_index[record.owner_id] = record.key_hash
-        self._save()
+    async def find_by_plaintext(self, plaintext: str) -> Optional[LicenseRecord]:
+        key_hash = hash_key(plaintext, self.salt)
+        data = await self.collection.find_one({"key_hash": key_hash})
+        return self._to_record(data) if data else None
 
-    def update(self, record: LicenseRecord) -> None:
-        self._records[record.key_hash] = record
-        self._owner_index = {
-            r.owner_id: h for h, r in self._records.items() if r.owner_id is not None
-        }
-        self._save()
-
-    def delete(self, key_hash: str) -> bool:
-        if key_hash not in self._records:
-            return False
-        rec = self._records.pop(key_hash)
-        if rec.owner_id and self._owner_index.get(rec.owner_id) == key_hash:
-            del self._owner_index[rec.owner_id]
-        self._save()
-        return True
-
-    def _save(self) -> None:
-        data = {h: r.to_dict() for h, r in self._records.items()}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
-        except Exception as e:
-            log.error("Failed to save licenses.json: %s", e)
-            return
-        self._rotate_backup(data)
-
-    def _rotate_backup(self, data: dict) -> None:
-        now = time.monotonic()
-        if now - self._last_backup < BACKUP_MIN_INTERVAL_SECONDS:
-            return
-        self._last_backup = now
-        stamp = _utcnow().strftime("%Y%m%dT%H%M%S%f")
-        try:
-            (self.backup_dir / f"licenses_{stamp}.json").write_text(
-                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            backups = sorted(self.backup_dir.glob("licenses_*.json"))
-            for stale in backups[: -self.backup_count]:
-                stale.unlink()
-        except Exception:
-            pass
