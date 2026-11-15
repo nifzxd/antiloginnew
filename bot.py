@@ -864,6 +864,20 @@ class SessionManager:
         try:
             result = await client(functions.account.GetAuthorizationsRequest())
         except Exception as e:
+            err_str = str(e).lower()
+            
+            # If session is dead/unregistered, remove it immediately and alert
+            if "not registered" in err_str or "authorized" in err_str or "authkey" in err_str:
+                logger.error("Session for %s is dead during auth fetch (%s). Removing.", phone, e)
+                with suppress(Exception):
+                    await client.disconnect()
+                self.clients.pop(phone, None)
+                owner = record.owner_id if record else None
+                await self.database.remove(phone)
+                await notify_admins_session_removed(self.bot_app, self.config, phone, str(e), owner)
+                return []
+            
+            # Otherwise, just log the error
             logger.error("Failed to fetch authorizations for %s: %s", phone, e)
             return []
 
