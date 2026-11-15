@@ -401,6 +401,7 @@ class SessionManager:
         self._reconnect_locks: dict[str, asyncio.Lock] = {}
         self._guarded_clients: weakref.WeakSet = weakref.WeakSet()
         self._ui_sessions: dict[str, tuple] = {}
+        self._reconnect_failures: dict[str, int] = {}
 
     async def is_protected(self, phone: str) -> bool:
         record = await self.database.get(phone)
@@ -575,6 +576,27 @@ class SessionManager:
         audit_logger.info("baseline_reset phone=%s ok=%s", phone, ok)
         return ok
 
+    async def notify_problematic_account(self, phone: str, reason: str):
+        admin_text = (
+            "⚠️ <b>Account Health Warning</b>\n"
+            f"Account: <code>{html.escape(phone)}</code>\n"
+            f"Status: Failed to reconnect 3 times in a row.\n"
+            f"Reason: <code>{html.escape(reason)}</code>\n\n"
+            f"Action needed: Check the logs or ask the user to re-login."
+        )
+        await _broadcast_to_admins(self.bot_app, self.config, admin_text)
+
+        record = await self.database.get(phone)
+        if record and record.owner_id and record.owner_id not in self.config.admin_ids:
+            user_text = (
+                "⚠️ <b>Account Connection Issue</b>\n\n"
+                f"We detected that your account <code>{html.escape(phone)}</code> is having trouble staying connected to our system.\n\n"
+                "This usually happens if your session was terminated by Telegram or if your internet connection is unstable.\n\n"
+                "Please check your account on your Telegram app. If it was logged out, please re-add it to the bot."
+            )
+            with suppress(Exception):
+                await self.bot_app.bot.send_message(record.owner_id, user_text, parse_mode=ParseMode.HTML)
+
     async def reconnect(self, phone: str) -> bool:
         lock = self._reconnect_locks.setdefault(phone, asyncio.Lock())
         async with lock:
@@ -619,6 +641,7 @@ class SessionManager:
                     self.clients.pop(phone, None)
                     raise
                 self._reconnect_delays.pop(phone, None)
+                self._reconnect_failures.pop(phone, None)
                 logger.info("Reconnected: %s", phone)
                 return True
             except INVALID_SESSION_ERRORS as e:
@@ -640,6 +663,14 @@ class SessionManager:
                 logger.error("Failed to reconnect %s: %s", phone, e)
                 with suppress(Exception):
                     await client.disconnect()
+                
+                fails = self._reconnect_failures.get(phone, 0) + 1
+                self._reconnect_failures[phone] = fails
+                
+                if fails == 3:
+                    self.track(asyncio.create_task(self.notify_problematic_account(phone, str(e))))
+                    self._reconnect_failures[phone] = 0
+                
                 return False
 
     async def reconnect_all(self):
@@ -805,12 +836,26 @@ class SessionManager:
                 logger.warning(
                     "Skipping session sweep for %s (%s): baseline not initialized", phone, source,
                 )
+                
+                # 1. Alert to Admin
                 await _broadcast_to_admins(
                     self.bot_app, self.config,
                     f"⚠️ <b>Baseline not ready</b> for <code>{html.escape(phone)}</code>\n"
                     f"Anti-login can't sweep session (<i>{html.escape(source)}</i>).\n"
                     f"Use the button <b>Reset Baseline</b>.",
                 )
+                
+                # 2. Alert to Buyer
+                if self.bot_app and record and record.owner_id and record.owner_id not in self.config.admin_ids:
+                    user_text = (
+                        "⚠️ <b>Protection Issue</b>\n\n"
+                        f"We couldn't properly initialize the protection for your account <code>{html.escape(phone)}</code>.\n\n"
+                        "This might be due to a temporary network issue or your session is invalid.\n"
+                        "If you want to ensure your account is protected, please open the account menu and press the <b>♻️ Reset Baseline</b> button."
+                    )
+                    with suppress(Exception):
+                        await self.bot_app.bot.send_message(record.owner_id, user_text, parse_mode=ParseMode.HTML)
+                
                 return []
             record = await self.database.get(phone)
             if not record:
@@ -906,31 +951,40 @@ async def notify_admins_login_attempt(bot_app: Optional[Application], config: Co
                 "🚨 <b>Security Alert</b>\n\n"
                 f"An unauthorized login attempt was detected on your account:\n"
                 f"<code>{html.escape(phone)}</code>\n\n"
-                "Our system has <b>automatically invalidated the OTP code</b>. Your account is safe.\n"
-                "If this wasn't you, please change your Telegram password immediately!"
+                "Our system has <b>automatically invalidated the OTP code</b>. Your account is safe."
             )
             with suppress(Exception):
                 await bot_app.bot.send_message(record.owner_id, user_text, parse_mode=ParseMode.HTML)
 
 
 async def notify_admins_session_removed(bot_app: Optional[Application], config: Config, phone: str, reason: str, owner_id: Optional[int] = None):
-    # Admin alert
+    reason_lower = reason.lower()
+    is_manual_logout = "authorized" in reason_lower or "authkey" in reason_lower or "revoked" in reason_lower
+
+    # 1. Text for Admin
+    admin_reason_text = "The bot session was forcefully logged out from the user's Telegram app." if is_manual_logout else html.escape(reason)
     admin_text = (
         "🧹 <b>Session Removed</b>\n"
         f"Account: <code>{html.escape(phone)}</code>\n"
-        f"Reason: {html.escape(reason)}\n"
+        f"Reason: {admin_reason_text}\n"
         "This account was disconnected and cleaned up from the database. Re-add it if needed."
     )
     await _broadcast_to_admins(bot_app, config, admin_text)
 
-    # User (Buyer) alert
+    # 2. Teks for Buyer
     if bot_app and owner_id and owner_id not in config.admin_ids:
+        if is_manual_logout:
+            buyer_reason = "You manually logged out the Anti-Login bot from your Telegram's <b>Active Sessions</b> menu."
+            action_text = "Because the bot was kicked out, it can no longer protect your account. If you want protection again, please add the account back."
+        else:
+            buyer_reason = f"<i>{html.escape(reason)}</i>"
+            action_text = "This usually happens if your internet is unstable or Telegram terminated the session. To protect it again, please add the account back to the bot."
+
         user_text = (
             "🧹 <b>Account Disconnected</b>\n\n"
             f"Your account <code>{html.escape(phone)}</code> has been removed from the Anti-Login system.\n\n"
-            f"<b>Reason:</b> <i>{html.escape(reason)}</i>\n\n"
-            "This usually happens if you logged out of that account manually on your phone, or if Telegram terminated the session.\n"
-            "To protect it again, please add the account back to the bot."
+            f"<b>Reason:</b> {buyer_reason}\n\n"
+            f"{action_text}"
         )
         with suppress(Exception):
             await bot_app.bot.send_message(owner_id, user_text, parse_mode=ParseMode.HTML)
