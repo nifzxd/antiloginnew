@@ -470,8 +470,9 @@ class SessionManager:
             with suppress(Exception):
                 await client.disconnect()
             self.clients.pop(phone, None)
+            owner = record.owner_id if record else None
             await self.database.remove(phone)
-            await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
+            await notify_admins_session_removed(self.bot_app, self.config, phone, str(e), owner)
         except Exception as e:
             self.clients.pop(phone, None)
             logger.error("Failed to load account %s: %s. Will retry via health check.", phone, e)
@@ -625,8 +626,9 @@ class SessionManager:
                 with suppress(Exception):
                     await client.disconnect()
                 self.clients.pop(phone, None)
+                owner = record.owner_id if record else None
                 await self.database.remove(phone)
-                await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
+                await notify_admins_session_removed(self.bot_app, self.config, phone, str(e), owner)
                 return False
             except FloodWaitError as e:
                 logger.warning("Reconnect for %s hit flood wait: %ds", phone, e.seconds)
@@ -675,8 +677,9 @@ class SessionManager:
                 with suppress(Exception):
                     await client.disconnect()
                 self.clients.pop(phone, None)
+                owner = record.owner_id if record else None
                 await self.database.remove(phone)
-                await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
+                await notify_admins_session_removed(self.bot_app, self.config, phone, str(e), owner)
                 return
             except Exception:
                 return
@@ -886,23 +889,51 @@ async def _broadcast_to_admins(bot_app: Optional[Application], config: Config, t
 
 
 async def notify_admins_login_attempt(bot_app: Optional[Application], config: Config, phone: str):
-    text = (
+    # Admin alert
+    admin_text = (
         "🚨 <b>Login Attempt Detected</b>\n"
         f"Account: <code>{html.escape(phone)}</code>\n"
         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         "The login code was automatically invalidated."
     )
-    await _broadcast_to_admins(bot_app, config, text)
+    await _broadcast_to_admins(bot_app, config, admin_text)
+
+    # User (Buyer) alert
+    if bot_app and _session_manager:
+        record = await _session_manager.database.get(phone)
+        if record and record.owner_id and record.owner_id not in config.admin_ids:
+            user_text = (
+                "🚨 <b>Security Alert</b>\n\n"
+                f"An unauthorized login attempt was detected on your account:\n"
+                f"<code>{html.escape(phone)}</code>\n\n"
+                "Our system has <b>automatically invalidated the OTP code</b>. Your account is safe.\n"
+                "If this wasn't you, please change your Telegram password immediately!"
+            )
+            with suppress(Exception):
+                await bot_app.bot.send_message(record.owner_id, user_text, parse_mode=ParseMode.HTML)
 
 
-async def notify_admins_session_removed(bot_app: Optional[Application], config: Config, phone: str, reason: str):
-    text = (
+async def notify_admins_session_removed(bot_app: Optional[Application], config: Config, phone: str, reason: str, owner_id: Optional[int] = None):
+    # Admin alert
+    admin_text = (
         "🧹 <b>Session Removed</b>\n"
         f"Account: <code>{html.escape(phone)}</code>\n"
         f"Reason: {html.escape(reason)}\n"
         "This account was disconnected and cleaned up from the database. Re-add it if needed."
     )
-    await _broadcast_to_admins(bot_app, config, text)
+    await _broadcast_to_admins(bot_app, config, admin_text)
+
+    # User (Buyer) alert
+    if bot_app and owner_id and owner_id not in config.admin_ids:
+        user_text = (
+            "🧹 <b>Account Disconnected</b>\n\n"
+            f"Your account <code>{html.escape(phone)}</code> has been removed from the Anti-Login system.\n\n"
+            f"<b>Reason:</b> <i>{html.escape(reason)}</i>\n\n"
+            "This usually happens if you logged out of that account manually on your phone, or if Telegram terminated the session.\n"
+            "To protect it again, please add the account back to the bot."
+        )
+        with suppress(Exception):
+            await bot_app.bot.send_message(owner_id, user_text, parse_mode=ParseMode.HTML)
 
 
 async def notify_admins_session_killed(
@@ -912,16 +943,34 @@ async def notify_admins_session_killed(
     if not bot_app or not config.admin_ids:
         return
 
-    lines = [
+    # Admin alert
+    admin_lines = [
         "🔪 <b>Unauthorized Session Killed</b>",
         f"Account: <code>{html.escape(phone)}</code>",
         f"Trigger: <i>{html.escape(source)}</i>",
         "",
     ]
     for auth in killed_sessions:
-        lines.append(_format_session(auth, prefix="• "))
+        admin_lines.append(_format_session(auth, prefix="• "))
 
-    await _broadcast_to_admins(bot_app, config, "\n".join(lines))
+    await _broadcast_to_admins(bot_app, config, "\n".join(admin_lines))
+
+    # User (Buyer) alert
+    if _session_manager:
+        record = await _session_manager.database.get(phone)
+        if record and record.owner_id and record.owner_id not in config.admin_ids:
+            user_lines = [
+                "🔪 <b>Unauthorized Session Terminated!</b>",
+                "",
+                f"The system detected a login from an unknown device on account <code>{html.escape(phone)}</code> and has automatically logged it out.",
+                "",
+                "<b>Terminated device details:</b>"
+            ]
+            for auth in killed_sessions:
+                user_lines.append(_format_session(auth, prefix="• "))
+            
+            with suppress(Exception):
+                await bot_app.bot.send_message(record.owner_id, "\n".join(user_lines), parse_mode=ParseMode.HTML)
 
 
 _config: Optional[Config] = None
